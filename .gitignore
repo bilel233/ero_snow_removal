@@ -9,3 +9,11 @@ ENV/
 .vscode/
 data/processed/
 data/figures/
+# extensions pour la phase 2
+*.shp
+*.dbf
+*.shx
+*.prj
+*.cpg
+*.qix
+*.pkl
