@@ -9,4 +9,4 @@ source .venv/bin/activate
 python -m pip install --upgrade pip wheel
 
 # Installation des dépendances a partir du fichier requirements
-pip install -r ../requirements.txt
+pip install -r ./requirements.txt
