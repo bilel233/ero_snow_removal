@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Optimisation drone + VRP pour déneigement"
 requires-python = ">=3.10"
 authors = [
-  { name = "Votre Nom" },
+  { name = "bilel.majdoub" },
 ]
 dependencies = [
   "networkx>=3.3",
