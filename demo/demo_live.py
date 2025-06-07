@@ -1,215 +1,130 @@
 #!/usr/bin/env python3
-"""
-Demo Snow‑Removal Fleet Simulation
----------------------------------
-A minimal live demo for the ERO snow‑removal project.
-
-* Builds a simple grid graph (street network) or loads one from a JSON file.
-* Computes a naive Eulerian tour (every edge exactly once) as a proxy for a snow‑clearing route.
-* Animates a single vehicle (truck or drone) moving along that tour in real time using Matplotlib.
-
-Usage
------
-$ python demo_simulation.py                  # 5×5 grid, default speed
-$ python demo_simulation.py --size 8 --speed 2.0  # larger grid, faster vehicle
-$ python demo_simulation.py --graph my_graph.json # load custom graph created by your pipeline
-
-Dependencies: networkx, matplotlib.  Install with:
-$ pip install networkx matplotlib
-
-The script is intentionally self‑contained so that reviewers can run a live simulation
-without installing OR‑Tools or other heavy solvers.
-"""
 from __future__ import annotations
-
 import argparse
-import itertools
-import json
-import math
 import pathlib
-import random
-import sys
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
-
+import pickle
+from typing import Dict, Tuple, List
+import matplotlib
+import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import networkx as nx
-from matplotlib.animation import FuncAnimation
 
+if matplotlib.get_backend() == "Agg":
+    print("[INFO] Backend 'Agg' détecté : aucune fenêtre interactive – une vidéo sera exportée.")
 
-@dataclass
-class VehicleState:
-    """Holds the dynamic state of the vehicle along the route."""
+NODE_POS_KEYS = ["pos", ("x", "y"), ("lon", "lat"), ("long", "lat")]
 
-    route_edges: List[Tuple[int, int]]
-    speed: float  # edges per second for simplicity
+def load_graph_pickle(path: str | pathlib.Path) -> nx.Graph:
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
-    edge_index: int = 0  # current edge in the route
-    distance_on_edge: float = 0.0  # progress 0–1 on current edge
+def get_node_positions(G: nx.Graph) -> Dict[int, Tuple[float, float]]:
+    
+    if all("pos" in G.nodes[n] for n in G.nodes):
+        return {n: tuple(G.nodes[n]["pos"]) for n in G.nodes}
+    
+    for pair in NODE_POS_KEYS[1:]:
+        kx, ky = pair if isinstance(pair, tuple) else (pair, pair)
+        if all(kx in G.nodes[n] and ky in G.nodes[n] for n in G.nodes):
+            return {n: (float(G.nodes[n][kx]), float(G.nodes[n][ky])) for n in G.nodes}
+ 
+    print("[WARN] positions manquantes – génération d'un spring_layout…")
+    return nx.spring_layout(G, seed=42)
 
-    def step(self, dt: float):
-        """Advance the vehicle by *dt* seconds."""
-        if self.edge_index >= len(self.route_edges):
-            return  # finished
-
-        self.distance_on_edge += self.speed * dt
-        while self.distance_on_edge >= 1.0 and self.edge_index < len(self.route_edges):
-            self.distance_on_edge -= 1.0
-            self.edge_index += 1
-            if self.edge_index >= len(self.route_edges):
-                break
-
-    @property
-    def finished(self) -> bool:
-        return self.edge_index >= len(self.route_edges)
-
-    def current_edge(self) -> Tuple[int, int] | None:
-        if self.finished:
-            return None
-        return self.route_edges[self.edge_index]
-
-
-# -----------------------------------------------------------------------------
-# Graph helpers
-# -----------------------------------------------------------------------------
-
-def make_grid_graph(n: int) -> nx.Graph:
-    """Return an n×n grid graph with (x, y) positions on nodes."""
-    G = nx.grid_2d_graph(n, n)  # Cartesian grid of size n
-    # Re‑label nodes with simple integer ids while storing positions
-    mapping = {}
-    pos = {}
-    for idx, node in enumerate(G.nodes()):
-        mapping[node] = idx
-        pos[idx] = node  # node is (x, y)
-    G = nx.relabel_nodes(G, mapping)
-    nx.set_node_attributes(G, {i: {"pos": tuple(map(float, coord))} for i, coord in pos.items()})
+def make_undirected(G: nx.Graph) -> nx.MultiGraph:
+    if G.is_directed():
+        G = G.to_undirected(as_view=False)
+    if not G.is_multigraph():
+        G = nx.MultiGraph(G)
     return G
 
+def compute_eulerian_tour(G: nx.Graph):
+    H = make_undirected(G)
+    if not nx.is_eulerian(H):
+        H = nx.eulerize(H)
+    return list(nx.eulerian_circuit(H)), H
 
-def load_graph_from_json(path: pathlib.Path) -> nx.Graph:
-    """Load a graph saved with nodes 'id', 'x', 'y' and edges 'u', 'v'."""
-    data = json.loads(path.read_text())
-    G = nx.Graph()
-    for node in data["nodes"]:
-        G.add_node(node["id"], pos=(node["x"], node["y"]))
-    for edge in data["edges"]:
-        G.add_edge(edge["u"], edge["v"])
-    return G
-
-
-# -----------------------------------------------------------------------------
-# Route planner – naive Eulerian tour
-# -----------------------------------------------------------------------------
-
-def compute_euler_tour(G: nx.Graph) -> List[Tuple[int, int]]:
-    """Return a list of directed edges forming an Eulerian tour.
-
-    For non‑Eulerian graphs we add duplicate edges (semi‑Eulerisation) so that
-    every street is ploughed at least once.
-    """
-    if not nx.is_eulerian(G):
-        G = nx.eulerize(G)  # duplicates some edges to make graph Eulerian
-    tour = list(nx.eulerian_circuit(G))  # list of (u, v)
-    return tour
-
-
-# -----------------------------------------------------------------------------
-# Animation
-# -----------------------------------------------------------------------------
-
-def animate_route(G: nx.Graph, route: List[Tuple[int, int]], speed: float, interval: int):
-    pos: Dict[int, Tuple[float, float]] = nx.get_node_attributes(G, "pos")
-
-    # Prepare matplotlib figure
+def animate(
+    G: nx.Graph,
+    pos: Dict[int, Tuple[float, float]],
+    tour: List[Tuple[int, int]],
+    *,
+    speed: float,
+    interval: int,
+    outfile: str = "animation_out.mp4",
+    blit: bool = False,
+) -> None:
     fig, ax = plt.subplots()
     ax.set_aspect("equal")
-    ax.set_title("Snow Removal Route Simulation")
     ax.axis("off")
+    nx.draw_networkx_nodes(G, pos, node_size=8, ax=ax)
+    nx.draw_networkx_edges(G, pos, alpha=0.15, ax=ax)
 
-    # Draw static background (streets)
-    nx.draw_networkx_edges(G, pos, ax=ax, width=1, edge_color="#cccccc")
-    nx.draw_networkx_nodes(G, pos, ax=ax, node_size=20, node_color="#333333")
+    vehicle, = ax.plot([], [], "ro", markersize=6)
 
-    # Vehicle marker
-    vehicle_marker, = ax.plot([], [], marker="s", markersize=10, linestyle="none")
+    segments = [(pos[u], pos[v]) for u, v in tour]
+    steps_per_segment = 10
+    total_frames = len(segments) * steps_per_segment
 
-    # Keep track of visited edges to recolor them when cleared
-    visited = set()
-    edge_artists = {}
+    def init():
+        vehicle.set_data([], [])
+        return vehicle,
 
-    for u, v in G.edges():
-        line = ax.plot([], [])[0]
-        edge_artists[(u, v)] = edge_artists[(v, u)] = line  # undirected
+    def update(frame: int):
+        seg_idx, step = divmod(frame, steps_per_segment)
+        start, end = segments[seg_idx]
+        t = step / steps_per_segment
+        x = start[0] + (end[0] - start[0]) * t
+        y = start[1] + (end[1] - start[1]) * t
+        vehicle.set_data([x], [y])
+        if step == 0:
+            ax.plot([start[0], end[0]], [start[1], end[1]], color="gray", linewidth=2)
+        return vehicle,
 
-    state = VehicleState(route, speed=speed)
+    ani = animation.FuncAnimation(
+        fig,
+        update,
+        frames=total_frames,
+        init_func=init,
+        interval=int(interval / speed),
+        repeat=False,
+        blit=blit,
+    )
 
-    # Pre‑draw all edge artists (so they are in the right order)
-    for (u, v), artist in edge_artists.items():
-        x1, y1 = pos[u]
-        x2, y2 = pos[v]
-        artist.set_data([x1, x2], [y1, y2])
-        artist.set_color("#cccccc")
-        artist.set_linewidth(2)
-
-    def update(frame_number):
-        nonlocal state
-        state.step(dt=interval / 1000.0)
-
-        edge = state.current_edge()
-        if edge is None:
-            vehicle_marker.set_visible(False)
-            return
-
-        u, v = edge
-        (x1, y1), (x2, y2) = pos[u], pos[v]
-        # Linear interpolation along the edge
-        x = x1 + (x2 - x1) * state.distance_on_edge
-        y = y1 + (y2 - y1) * state.distance_on_edge
-        vehicle_marker.set_data([x], [y])
-        vehicle_marker.set_color("red")
-
-        # Mark edge as visited (cleared)
-        if edge not in visited:
-            visited.add(edge)
-            edge_artists[edge].set_color("#0080ff")  # blue cleared edge
-
-    ani = FuncAnimation(fig, update, interval=interval)
-    plt.show()
-
-
-# -----------------------------------------------------------------------------
-# Main CLI
-# -----------------------------------------------------------------------------
-
-def parse_args(argv: List[str] | None = None):
-    p = argparse.ArgumentParser(description="Live simulation of a snow‑removal route")
-    p.add_argument("--graph", type=pathlib.Path, default=None,
-                   help="Path to JSON graph file (default: generate grid)")
-    p.add_argument("--size", type=int, default=5,
-                   help="Grid size if no graph file supplied (default: 5)")
-    p.add_argument("--speed", type=float, default=1.0,
-                   help="Vehicle speed in edges per second (default: 1.0)")
-    p.add_argument("--interval", type=int, default=100,
-                   help="Animation frame interval in milliseconds (default: 100)")
-    return p.parse_args(argv)
-
-
-def main(argv: List[str] | None = None):
-    args = parse_args(argv)
-
-    if args.graph is None:
-        G = make_grid_graph(args.size)
+    if matplotlib.get_backend() == "Agg":
+        ani.save(outfile, writer="ffmpeg", fps=max(1, int(1000 / interval)))
+        print(f"[OK] Vidéo enregistrée → {outfile}")
     else:
-        if not args.graph.exists():
-            print(f"Graph file {args.graph} not found", file=sys.stderr)
-            sys.exit(1)
-        G = load_graph_from_json(args.graph)
+        plt.show()
 
-    route = compute_euler_tour(G)
-    print(f"Route length: {len(route)} edges")
+def parse_args():
+    p = argparse.ArgumentParser(description="Animation d’une tournée de déneigement")
+    grp = p.add_mutually_exclusive_group(required=True)
+    grp.add_argument("--sector", type=str, help="Nom du secteur pré‑traité (Outremont, Verdun, …)")
+    grp.add_argument("--graph", type=str, help="Chemin vers un pickle NetworkX")
+    grp.add_argument("--size", type=int, help="Taille n pour générer une grille n×n de test")
+    p.add_argument("--speed", type=float, default=1.0, help="Facteur de vitesse (1 = temps réel)")
+    p.add_argument("--interval", type=int, default=100, help="Intervalle ms entre frames (≥30 recommandé)")
+    p.add_argument("--out", type=str, default="animation_out.mp4", help="Nom du fichier MP4 si export")
+    p.add_argument("--blit", action="store_true", help="Active le blitting (plus rapide mais exigeant)")
+    return p.parse_args()
 
-    animate_route(G, route, speed=args.speed, interval=args.interval)
+def main():
+    args = parse_args()
+
+    if args.size:
+        G = nx.grid_2d_graph(args.size, args.size)
+        G = nx.convert_node_labels_to_integers(G)
+    else:
+        gpath = pathlib.Path(f"data/processed/graph_sector_{args.sector}.pkl") if args.sector else pathlib.Path(args.graph)
+        if not gpath.exists():
+            raise FileNotFoundError(f"Fichier graphe introuvable : {gpath}")
+        G = load_graph_pickle(gpath)
+
+    pos = get_node_positions(G)
+    tour, H = compute_eulerian_tour(G)
+
+    animate(H, pos, tour, speed=args.speed, interval=args.interval, outfile=args.out, blit=args.blit)
 
 
 if __name__ == "__main__":
