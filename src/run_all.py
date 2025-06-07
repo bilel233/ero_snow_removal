@@ -5,7 +5,7 @@ from carp_mvp import compute_tournees, analyze_solution_quality
 
 def run_pipeline():
     print(" Chargement du graphe")
-    gpath = Path("data/outremont.gpickle")
+    gpath = "data/processed/graph_sector_Verdun.pkl"
     with open(gpath, "rb") as f:
         G = pickle.load(f)
 
